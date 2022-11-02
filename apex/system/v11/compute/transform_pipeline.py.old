@@ -1,0 +1,271 @@
+import dask
+import dask.dataframe as dd
+import numba as nb
+import numpy as np
+import pandas as pd
+from dask import delayed
+from dask.distributed import get_client
+from toolz import partial, valmap, curry
+import bottleneck as bn
+
+import xarray as xr
+from apex.pipelines.volatility import (garman_klass_vol_estimate,
+                                       parkinson_vol_estimate,
+                                       rogers_satchell_yoon_vol_estimate)
+from apex.system.v11.data import APEX__MARKET_DATA_FIELDS, ds_to_df
+from apex.toolz.dask import ApexDaskClient
+from apex.toolz.itertools import flatten
+from apex.system.v11.compute.smart_beta import apex__compute_smart_beta_factors, SMART_BETAS
+from apex.system.v11.compute.market_alpha import MARKET_ALPHAS
+from dask.delayed import Delayed
+from apex.system.v11.backtest import apex__backtest_portfolio_weights
+from apex.system import apex__dataset
+import uuid
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures
+from dataclasses import dataclass
+from toolz import partition_all
+from apex.toolz.dask import ApexDaskClient
+import dask
+from dask.distributed import as_completed
+
+
+TEMPORARY_SAVE_FOLDER = Path('/apex.data/apex.portfolios/tmp/')
+SAVE_FOLDER = Path('/apex.data/apex.portfolios/apex/')
+
+TRANSFORMS = {
+    'identity': lambda x: x,
+    'delayed': lambda x: x.shift(1),
+
+    'ewm2': lambda x: x.ewm(halflife=2).mean(),
+    'ewm5': lambda x: x.ewm(halflife=5).mean(),
+    'ewm10': lambda x: x.ewm(halflife=10).mean(),
+    'ewm20': lambda x: x.ewm(halflife=20).mean(),
+    'ewm50': lambda x: x.ewm(halflife=50).mean(),
+    'ewm100': lambda x: x.ewm(halflife=100).mean(),
+}
+
+def apex__alpha_wrapper(fn):
+    def wrapped(apex_data, availability=None):
+        if isinstance(apex_data, xr.Dataset):
+            market_data = ds_to_df(apex_data[['px_last', 'px_open', 'px_high', 'px_low', 'px_volume', 'returns', 'default_availability']])
+        else:
+            market_data = apex_data[['px_last', 'px_open', 'px_high', 'px_low', 'px_volume', 'returns', 'default_availability']]
+
+        if availability is None:
+            availability = market_data['default_availability'].fillna(False)
+        return fn(opens=market_data['px_open'],
+                  highs=market_data['px_high'],
+                  lows=market_data['px_low'],
+                  closes=market_data['px_last'],
+                  returns=market_data['returns'],
+                  volumes=market_data['px_volume'])[availability]
+    return wrapped
+
+MARKET_ALPHAS = {x: apex__alpha_wrapper(MARKET_ALPHAS[x]) for x in MARKET_ALPHAS}
+
+
+def apex__save_portfolio_data(portfolio, folder):
+    if not folder.exists():
+        folder.mkdir(parents=True, exist_ok=True)
+    filename = uuid.uuid4().hex + '.pq'
+    filename = folder / filename
+    portfolio.to_parquet(filename)
+    return filename
+
+
+def rank_max_abs_scaler(raw_data, axis=0):
+    """
+    Axis=1 means computing it in time-series way.
+    """
+    data = raw_data.replace([np.inf, -np.inf], np.nan)
+    if axis == 1:
+        data = data.T
+        maxval = data.expanding().max()
+        minval = data.expanding().min()
+        data = data + minval
+        data = data/maxval
+        result = data.T
+    else:
+        data = data.rank(axis=1) - 1
+        maxval = data.max(axis=1)
+        scale = 1/maxval
+        result = data.multiply(scale, axis=0)
+    return result
+
+
+def apex__compute_vol_weighted_portfolio(dataset, portfolio, halflife=40):
+    returns = dataset['returns']
+    vol = returns.ewm(halflife=halflife).std()
+    portfolio = portfolio * vol
+    portfolio = portfolio.divide(portfolio.abs().sum(axis=1), axis=0)[dataset['default_availability']]
+    return portfolio
+
+
+def apex__compute_inverse_vol_weighted_portfolio(dataset, portfolio, halflife=40):
+    returns = dataset['returns']
+    vol = returns.ewm(halflife=halflife).std()
+    inv_vol = 1/vol
+    portfolio = portfolio * inv_vol
+    portfolio = portfolio.divide(portfolio.abs().sum(axis=1), axis=0)[dataset['default_availability']]
+    return portfolio
+
+
+@nb.njit
+def apex__nb_compute_low_turnover_weights(returns, availability, portfolio, blend_multiplier):
+    """
+    Blend every day at rate = blend multiplier / 2
+    """
+    new_port = np.zeros_like(portfolio)
+    new_port[0] = portfolio[0]
+    rets = returns + 1
+    for day in range(1, len(portfolio)):
+        curr_pos = new_port[day - 1] * rets[day]
+        curr_val = np.sum(curr_pos)
+        curr_wt = curr_pos/curr_val
+        new_pos = curr_wt + (portfolio[day] - curr_wt) * blend_multiplier[day]
+        new_pos[~availability[day]] = 0
+        new_port[day] = new_pos/np.sum(np.abs(new_pos))
+    return new_port
+
+
+def apex__compute_drifting_turnover_constrained_portfolio(dataset, portfolio, turnover_period, save_loc=None, variance_halflife=20, maximum_gap_close=0.5):
+    returns = dataset['returns']
+    returns = returns.fillna(0).loc['1990':] # just because
+    var = returns.ewm(halflife=variance_halflife).var().fillna(0)
+    var = var.median(axis=1).dropna()
+    var_per_day = var.expanding().median()
+
+    # compute number of median days equivalent to rebalancing days
+    turns_per_variance_day = 1/turnover_period
+    blend_multiplier = var/var_per_day * turns_per_variance_day
+
+    # Now let's set up everything for numpy
+    np_port = portfolio.fillna(0).values
+
+    np_returns = returns.reindex(portfolio.index)[portfolio.columns].fillna(0).values
+    np_availability = dataset['default_availability'].reindex(portfolio.index)[portfolio.columns].fillna(0).values
+    np_blend_multiplier = np.minimum(blend_multiplier.reindex(portfolio.index), maximum_gap_close).fillna(0).values
+
+    result = apex__nb_compute_low_turnover_weights(np_returns, np_availability, np_port, np_blend_multiplier)
+    result = pd.DataFrame(result, index=portfolio.index, columns=portfolio.columns)
+    filename = apex__save_portfolio_data(result, save_loc)
+    return result
+
+def apex__transform_pipeline(dataset, raw_alpha, long_only=True):
+    """
+    1. Transform
+    2. Compute portfolio construction (inv vol weighted, vol weighetd, etc)
+    """
+    base_alpha = rank_max_abs_scaler(raw_alpha)
+    results = []
+    for cutoff in [0, 0.25, 0.5]:
+        for transform_name, transform_fn in TRANSFORMS.items():
+            tdata = transform_fn(base_alpha[base_alpha >= cutoff])[dataset['default_availability']]
+            normalized_tdata = rank_max_abs_scaler(tdata)[dataset['default_availability']]
+            if not long_only:
+                normalized_tdata = normalized_tdata.subtract(normalized_tdata.mean(axis=1), axis=0)
+            normalized_tdata = normalized_tdata.divide(normalized_tdata.sum(axis=1), axis=0)
+            results.append(normalized_tdata)
+    return results
+
+def apex__create_turnover_constrained_portfolios(dataset, base_portfolio, save_loc=None):
+    turnover_periods = [1, 5, 10, 20, 40]
+    filenames = [apex__compute_drifting_turnover_constrained_portfolio(dataset, base_portfolio, x, save_loc=save_loc) for x in turnover_periods]
+    filenames.append(apex__save_portfolio_data(base_portfolio, save_loc))
+    return filenames
+
+def apex__compute_pipeline(dataset, raw_alpha, transform_fn=None, save_loc=None):
+    """
+    Steps:
+    1. Transform raw alphas
+    2. Compute portfolios
+    """
+    transformed_portfolios = transform_fn(dataset, raw_alpha)
+    inv_vol_weighted_portfolios = [apex__compute_inverse_vol_weighted_portfolio(dataset, x) for x in transformed_portfolios]
+
+    portfolios = transformed_portfolios + inv_vol_weighted_portfolios
+    filenames = flatten([apex__create_turnover_constrained_portfolios(dataset, x, save_loc=save_loc) for x in portfolios])
+    return filenames
+
+def apex__compute_portfolios_with_alpha(dataset, raw_alpha, save_loc=None, long_only=True):
+    transform_fn = curry(apex__transform_pipeline, long_only=long_only)
+    portfolio_files = apex__compute_pipeline(dataset, raw_alpha, transform_fn=transform_fn, save_loc=save_loc)
+    portfolio_files += apex__compute_pipeline(dataset, -raw_alpha, transform_fn=transform_fn, save_loc=save_loc)
+    return portfolio_files
+
+
+def apex__select_and_combine_portfolios(dataset, files, save_loc=None, long_only=True):
+    """
+    Algorithm:
+    1. Compute stats for each portfolio
+    2. Sort the portfolio by calmar ratio
+    """
+    results = {}
+    for file in files:
+        results[file] = apex__backtest_portfolio_weights(dataset, pd.read_parquet(file))
+
+    calmar_ratios = [(x, results[x]['stats']['calmar_ratio']) for x in results]
+    calmar_ratios = sorted(calmar_ratios, key=lambda x: -x[1])
+    selection = [x[0] for x in calmar_ratios[:50]] # Top 50 portfolios
+
+    portfolio = None
+
+    for file in files:
+        data = apex__backtest_portfolio_weights(dataset, pd.read_parquet(file))
+        if portfolio is None:
+            portfolio = data
+        else:
+            portfolio += data
+
+    portfolio = portfolio / len(selection)
+    return apex__save_portfolio_data(portfolio, save_loc)
+
+
+def apex__alpha_pipeline(dataset, alpha_fn, save_loc, long_only=True):
+    raw_alpha_d = alpha_fn(dataset)
+    filenames = apex__compute_portfolios_with_alpha(dataset, raw_alpha_d, save_loc=save_loc / 'subportfolios', long_only=long_only)
+    #port_filename = apex__select_and_combine_portfolios(dataset, filenames, save_loc=save_loc / 'master', long_only=long_only)
+    return dask.delayed(filenames)
+
+
+def apex__compute_alphas_pipeline(dataset, alphas, long_only=True, batch_size=5):
+    clt = ApexDaskClient()
+    alphas = list(alphas.items())
+    batches = list(partition_all(batch_size, alphas))
+    dataset = ds_to_df(dataset)
+    dataset_d = dask.delayed(dataset)
+
+
+    run_id = uuid.uuid4().hex
+    base_folder = SAVE_FOLDER / pd.Timestamp.now().strftime('%Y%m%d') / run_id
+
+    futures = {}
+    results = {}
+    for (alpha_name, alpha_fn) in alphas:
+        folder = base_folder / alpha_name
+        if long_only:
+            folder = folder / 'long_only'
+        else:
+            folder = folder / 'long_short'
+        folder.mkdir(exist_ok=True, parents=True)
+        fut = clt.compute(apex__alpha_pipeline(dataset_d, alpha_fn, folder, long_only=long_only))
+        futures[fut] = alpha_name
+        if len(futures) == batch_size:
+            for future, result in as_completed(futures, with_results=True):
+                results[futures[future]] = result
+                print('[APEX] Finalized computing', futures[future])
+                break
+            del futures[future]
+
+    print('outside')
+    for future, result in as_completed(futures, with_results=True):
+        results[futures[future]] = result
+        print('[APEX] Finalized computing', futures[future])
+
+    return {
+        'run_id': run_id,
+        'base_folder': base_folder,
+        'results': results
+    }

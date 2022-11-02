@@ -1,0 +1,206 @@
+import dask
+import dask.dataframe as dd
+import numba as nb
+import numpy as np
+import pandas as pd
+from dask import delayed
+from dask.distributed import get_client
+from toolz import partial, valmap, curry
+import bottleneck as bn
+
+import xarray as xr
+from apex.pipelines.volatility import (garman_klass_vol_estimate,
+                                       parkinson_vol_estimate,
+                                       rogers_satchell_yoon_vol_estimate)
+from apex.system.v11.data import APEX__MARKET_DATA_FIELDS, ds_to_df
+from apex.toolz.dask import ApexDaskClient
+from apex.toolz.itertools import flatten
+from apex.system.v11.compute.market_alpha import MARKET_ALPHAS
+from dask.delayed import Delayed
+from apex.system.v11.backtest import apex__backtest_portfolio_weights
+from apex.system import apex__dataset
+import uuid
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures
+from dataclasses import dataclass
+from toolz import partition_all
+from apex.toolz.dask import ApexDaskClient
+import dask
+from dask.distributed import as_completed
+import shutil
+
+TEMPORARY_SAVE_FOLDER = Path('/apex.data/apex.portfolios/tmp/')
+SAVE_FOLDER = Path('/apex.data/apex.portfolios/apex/')
+
+SMART_BETAS = [
+    'enterprise_value',
+    'cur_mkt_cap',
+    'ebitda_growth_to_mkt_cap',
+    'ev_to_t12m_ebitda',
+    'cashflow_yield',
+    'cashflow_yield_t12m',
+    'earnings_quality',
+    'dividend_yield',
+    'dividend_yield_t12m',
+    'dividend_growth_12m',
+    'profitability_factor',
+    'debt_to_tot_assets',
+    'debt_to_ebitda',
+    'debt_to_mkt_val',
+    'debt_to_cur_ev',
+    'earnings_yield_t12m',
+    'earnings_yield_curr',
+    'px_to_free_cashflow',
+    'px_to_t12m_free_cashflow',
+    'pe_ratio',
+    'px_to_book_ratio',
+    'sales_growth',
+    'volatility_factor',
+    'momentum_12-1',
+    'leverage_and_liquidity',
+    'berry_ratio',
+    'cashflow_roe',
+    'roic_change',
+    'operating_efficiency_factor',
+    'asset_growth',
+    'earnings_revision_chg',
+    'size_factor',
+    'credit_factor',
+    'credit_factor_alt',
+    'short_int_ratio',
+    'shareholder_yield'
+]
+
+TRANSFORMS = {
+    'identity': lambda x: x,
+    'delayed': lambda x: x.shift(1),
+
+    'ewm1': lambda x: x.ewm(halflife=1).mean(),
+    'ewm3': lambda x: x.ewm(halflife=3).mean(),
+    'ewm5': lambda x: x.ewm(halflife=5).mean(),
+    'ewm10': lambda x: x.ewm(halflife=10).mean(),
+    'ewm20': lambda x: x.ewm(halflife=20).mean(),
+    'ewm50': lambda x: x.ewm(halflife=50).mean(),
+    'ewm100': lambda x: x.ewm(halflife=100).mean(),
+}
+
+DIFFED_TRANSFORMS = {
+    'ewm1_diffed': lambda x: x.ewm(halflife=1).mean().diff(),
+    'ewm3_diffed': lambda x: x.ewm(halflife=3).mean().diff(),
+    'ewm5_diffed': lambda x: x.ewm(halflife=5).mean().diff(),
+    'ewm10_diffed': lambda x: x.ewm(halflife=10).mean().diff(),
+    'ewm20_diffed': lambda x: x.ewm(halflife=20).mean().diff(),
+    'ewm50_diffed': lambda x: x.ewm(halflife=50).mean().diff(),
+    'ewm100_diffed': lambda x: x.ewm(halflife=100).mean().diff(),
+}
+
+def apex__alpha_wrapper(fn):
+    def wrapped(apex_data, availability=None):
+        if isinstance(apex_data, xr.Dataset):
+            market_data = ds_to_df(apex_data[['px_last', 'px_open', 'px_high', 'px_low', 'px_volume', 'returns', 'default_availability']])
+        else:
+            market_data = apex_data[['px_last', 'px_open', 'px_high', 'px_low', 'px_volume', 'returns', 'default_availability']]
+
+        if availability is None:
+            availability = market_data['default_availability'].fillna(False)
+        return fn(opens=market_data['px_open'],
+                  highs=market_data['px_high'],
+                  lows=market_data['px_low'],
+                  closes=market_data['px_last'],
+                  returns=market_data['returns'],
+                  volumes=market_data['px_volume'])[availability]
+    return wrapped
+
+MARKET_ALPHAS = {x: apex__alpha_wrapper(MARKET_ALPHAS[x]) for x in MARKET_ALPHAS}
+
+def apex__save_portfolio_data(portfolio, folder):
+    if not folder.exists():
+        folder.mkdir(parents=True, exist_ok=True)
+    filename = uuid.uuid4().hex + '.pq.gz'
+    filename = folder / filename
+    portfolio.to_parquet(filename, compression='gzip')
+    return filename
+
+def apex__transform_pipeline(dataset, raw_alpha, save_loc=None, availability='basic_availability'):
+    """
+    1. Transform
+    2. Compute portfolio construction (inv vol weighted, vol weighetd, etc)
+    """
+    results = {}
+
+    base_alpha = raw_alpha.copy()
+    for transform_name, transform_fn in TRANSFORMS.items():
+        transform_name += '_pos'
+        tdata = transform_fn(base_alpha)[dataset[availability]]
+        normalized_tdata = tdata.rank(axis=1)
+        if save_loc is not None:
+            apex__save_portfolio_data(normalized_tdata, save_loc)
+        else:
+            results[transform_name] = normalized_tdata
+
+    for transform_name, transform_fn in DIFFED_TRANSFORMS.items():
+        transform_name += '_pos'
+        tdata = transform_fn(base_alpha)[dataset[availability]]
+        normalized_tdata = tdata.rank(axis=1)
+        if save_loc is not None:
+            apex__save_portfolio_data(normalized_tdata, save_loc)
+        else:
+            results[transform_name] = normalized_tdata
+
+    base_alpha = -raw_alpha.copy()
+    for transform_name, transform_fn in TRANSFORMS.items():
+        transform_name += '_neg'
+        tdata = transform_fn(base_alpha)[dataset[availability]]
+        normalized_tdata = tdata.rank(axis=1)
+        if save_loc is not None:
+            apex__save_portfolio_data(normalized_tdata, save_loc)
+        else:
+            results[transform_name] = normalized_tdata
+
+    for transform_name, transform_fn in DIFFED_TRANSFORMS.items():
+        transform_name += '_neg'
+        tdata = transform_fn(base_alpha)[dataset[availability]]
+        normalized_tdata = tdata.rank(axis=1)
+        if save_loc is not None:
+            apex__save_portfolio_data(normalized_tdata, save_loc)
+        else:
+            results[transform_name] = normalized_tdata
+
+    if save_loc is not None:
+        return True
+    else:
+        return results
+
+
+def ds_to_df(dataset):
+    """
+    dataset has dims ticker and time
+    """
+    return dataset.to_dataframe().unstack('ticker')
+
+
+def apex__transform_pipeline_smart_beta_task(universe_name, availability, ds=None, **kwargs):
+    from apex.system.v11.data import apex__dataset
+    data = ds_to_df(apex__dataset(universe_name)).loc[:ds]
+    result = {}
+    for beta in SMART_BETAS:
+        raw_alpha = data[beta].to_dataframe()
+        save_loc = Path(f'/apex.data/apex.portfolios/{universe_name}/{ds}/raw_alphas/{beta}')
+        save_loc.mkdir(exist_ok=True, parents=True)
+        result[beta] = apex__transform_pipeline(data, raw_alpha, availability=availability, save_loc=save_loc)
+    return result
+
+
+def apex__transform_pipeline_alpha_family_task(universe_name, alpha_family, availability, ds=None, **kwargs):
+    from apex.system.v11.data import apex__dataset
+    from apex.system.v11.compute.market_alpha import MARKET_ALPHAS_BY_FAMILY
+    data = ds_to_df(apex__dataset(universe_name)).loc[:ds]
+    result = {}
+    for alpha_name, alpha_fn in MARKET_ALPHAS_BY_FAMILY[alpha_family].items():
+        alpha_fn = apex__alpha_wrapper(alpha_fn)
+        raw_alpha = alpha_fn(data)
+        save_loc = Path(f'/apex.data/apex.portfolios/{universe_name}/{ds}/raw_alphas/{alpha_family}')
+        save_loc.mkdir(exist_ok=True, parents=True)
+        result[alpha_name] = apex__transform_pipeline(data, raw_alpha, save_loc=save_loc, availability=availability)
+    return result
