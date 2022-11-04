@@ -16,7 +16,7 @@ from distributed.diagnostics.plugin import SchedulerPlugin
 def ddict():
     return defaultdict(ddict)
 
-def ApexDaskClient(**kwargs):
+def ApexDaskClient():
     return Client()
 
 
