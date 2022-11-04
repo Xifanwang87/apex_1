@@ -17,7 +17,7 @@ def ddict():
     return defaultdict(ddict)
 
 def ApexDaskClient(**kwargs):
-    return Client(address='10.15.201.154:8786', **kwargs)
+    return Client()
 
 
 FutureKind = (Future, cf.Future, ActorFuture)
